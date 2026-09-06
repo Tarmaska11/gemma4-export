@@ -1,0 +1,158 @@
+# Gemma 4 -> .litertlm re-export, on a PUBLIC-repo GitHub-hosted runner.
+#
+# WHY A PUBLIC REPO: private runners are 2 cores / 8 GB and burn the free-minutes
+# allotment; public runners are 4 cores / 16 GB and are free+unlimited. This job
+# contains nothing private -- a public Google model through a public Google tool.
+#
+# MEASURED FACTS inherited from gemma4e-compile.yml (run 28809381450), do not re-learn:
+#   * /mnt is the SAME root disk as / (~72 GB). A swapfile on /mnt does NOT buy
+#     independent space -- a 12 G one there caused disk-full during a 10.2 GB download.
+#   * `docker image prune -af` reclaims ~4 GB.
+# The preinstalled toolchains (Android SDK, .NET, GHC, CodeQL) are another ~25 GB.
+#
+# METHOD: the FIRST run must be a CONTROL -- defaults only, aimed at reproducing a
+# working stock-equivalent artifact. Only once a control passes on-device do we vary
+# --prefill_lengths / --quantization_recipe. A failure from a varied first run is
+# unattributable, and litert-torch#994 reports exactly this export silently producing
+# a model that loads and then emits only <pad>.
+
+name: gemma4-export
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "E2B (9.5 GB source, do this first) or E4B (14.9 GB)"
+        type: choice
+        options: ["E2B", "E4B"]
+        default: "E2B"
+      quantization_recipe:
+        description: "AI Edge Quantizer recipe. Empty = tool default (dynamic_wi8_afp32)."
+        type: string
+        default: ""
+      prefill_lengths:
+        description: "Comma-separated prefill signature widths. Empty = tool default."
+        type: string
+        default: ""
+      cache_length:
+        description: "KV cache length. Empty = tool default."
+        type: string
+        default: ""
+      swap_gb:
+        description: "Swapfile size in GB (16 GB RAM + this)."
+        type: string
+        default: "28"
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360        # 6 h is the GitHub-hosted hard ceiling
+
+    steps:
+      - name: Report runner (prove which tier we actually got)
+        run: |
+          echo "::group::specs"
+          nproc; free -h; df -h /; echo; cat /proc/cpuinfo | grep -m1 "model name"
+          echo "::endgroup::"
+          MEM=$(free -g | awk '/^Mem:/{print $2}')
+          if [ "$MEM" -lt 15 ]; then
+            echo "::warning::Only ${MEM} GB RAM -- this is the 2-core/8GB PRIVATE tier."
+            echo "::warning::Move this workflow to a PUBLIC repo for 4 cores / 16 GB."
+          fi
+
+      - name: Reclaim disk (~30 GB)
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost /usr/share/swift || true
+          sudo docker image prune -af || true
+          sudo apt-get clean
+          echo "after reclaim:"; df -h / | tail -1
+
+      - name: Add swap
+        run: |
+          SW="${{ inputs.swap_gb }}"
+          # swapfile MUST live on / -- /mnt is the same disk (measured, see header)
+          sudo fallocate -l ${SW}G /swapfile-export
+          sudo chmod 600 /swapfile-export
+          sudo mkswap /swapfile-export
+          sudo swapon /swapfile-export
+          sudo sysctl vm.swappiness=100      # we WANT aggressive swapping here
+          free -h; df -h / | tail -1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install litert-torch (CPU torch only)
+        run: |
+          python -m pip install --upgrade pip
+          # CPU wheel first so the CUDA torch (~2.5 GB extra) is never pulled
+          pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+          pip install --no-cache-dir litert-torch
+          echo "::group::versions"
+          pip list 2>/dev/null | grep -iE "litert|torch|ai-edge|jax|transformers|quantizer"
+          echo "::endgroup::"
+          df -h / | tail -1
+
+      - name: Download source weights
+        env:
+          V: ${{ inputs.variant }}
+        run: |
+          python - <<'PY'
+          import os
+          from huggingface_hub import snapshot_download
+          v = os.environ["V"]
+          p = snapshot_download(
+              f"google/gemma-4-{v}-it",
+              local_dir=f"src-{v}",
+              allow_patterns=["*.json", "*.safetensors", "tokenizer*", "*.model"],
+          )
+          print("downloaded to", p)
+          PY
+          du -sh "src-${V}"; df -h / | tail -1
+
+      - name: Export to .litertlm
+        id: export
+        run: |
+          V="${{ inputs.variant }}"
+          ARGS=""
+          [ -n "${{ inputs.quantization_recipe }}" ] && ARGS="$ARGS --quantization_recipe=${{ inputs.quantization_recipe }}"
+          [ -n "${{ inputs.prefill_lengths }}"    ] && ARGS="$ARGS --prefill_lengths=${{ inputs.prefill_lengths }}"
+          [ -n "${{ inputs.cache_length }}"       ] && ARGS="$ARGS --cache_length=${{ inputs.cache_length }}"
+          echo "extra args:${ARGS:- (none - CONTROL run)}"
+          set -o pipefail
+          set -x
+          /usr/bin/time -v litert-torch export_hf \
+            --model="src-${V}" \
+            --output_dir="out-${V}" \
+            --externalize_embedder \
+            --jinja_chat_template_override="litert-community/gemma-4-${V}-it-litert-lm" \
+            $ARGS 2>&1 | tee export.log
+          set +x
+          echo "--- result ---"; ls -la "out-${V}"; free -h; df -h / | tail -1
+
+      - name: Split output for release (2 GB asset cap)
+        if: always()
+        run: |
+          V="${{ inputs.variant }}"
+          mkdir -p dist
+          for f in out-${V}/*.litertlm; do
+            [ -e "$f" ] || continue
+            echo "$(basename "$f"): $(stat -c%s "$f") bytes"
+            sha256sum "$f" | tee -a dist/SHA256SUMS
+            split -b 1900M -d "$f" "dist/$(basename "$f").part"
+          done
+          ls -la dist/ 2>/dev/null || echo "no output produced"
+
+      - name: Upload artifacts (logs always, model if produced)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemma4-${{ inputs.variant }}-export
+          path: |
+            dist/
+            export.log
+          retention-days: 7
+          if-no-files-found: warn
