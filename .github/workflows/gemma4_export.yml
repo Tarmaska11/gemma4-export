@@ -134,14 +134,23 @@ jobs:
           # agent keeps enough memory to send its heartbeat. This attacks the observed
           # failure mode; shrinking the graph did not, because the wall is the 15 GB of
           # bf16 weights, not the MLIR.
+          # Do NOT use `sudo systemd-run` here: it runs as root with root's PATH and
+          # cannot see the runner user's litert-torch (run 9 died at exit 127 in 3 min,
+          # before the export even started). Put THIS shell into a capped cgroup instead,
+          # so the environment, PATH and python install are all preserved and every child
+          # inherits the cap.
           MH="${{ inputs.mem_high_gb }}"
-          RUNNER=""
           if [ -n "$MH" ] && [ "$MH" != "0" ]; then
-            RUNNER="sudo systemd-run --scope --quiet -p MemoryHigh=${MH}G -p MemorySwapMax=infinity"
-            echo "export capped at MemoryHigh=${MH}G (runner agent keeps the rest)"
+            sudo mkdir -p /sys/fs/cgroup/exportcap
+            echo "+memory" | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null 2>&1 || true
+            echo "${MH}G"  | sudo tee /sys/fs/cgroup/exportcap/memory.high  >/dev/null
+            echo "max"     | sudo tee /sys/fs/cgroup/exportcap/memory.swap.max >/dev/null 2>&1 || true
+            echo $$        | sudo tee /sys/fs/cgroup/exportcap/cgroup.procs >/dev/null
+            echo "cgroup cap applied: memory.high=$(cat /sys/fs/cgroup/exportcap/memory.high)"
+            echo "  this shell is $(cat /proc/self/cgroup | head -1)"
           fi
           set -x
-          $RUNNER /usr/bin/time -v litert-torch export_hf \
+          /usr/bin/time -v litert-torch export_hf \
             --model="src-${V}" \
             --output_dir="out-${V}" \
             --externalize_embedder \
