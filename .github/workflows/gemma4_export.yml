@@ -38,6 +38,10 @@ on:
         description: "KV cache length. Empty = tool default."
         type: string
         default: ""
+      extra_args:
+        description: "Raw extra flags for export_hf, e.g. '--experimental_lightweight_conversion=True --use_sdpa_composite=True'. The dataclass ExportableModuleConfig has ~70 fields; fire exposes all of them."
+        type: string
+        default: ""
       mem_high_gb:
         description: "Cap the export via cgroup MemoryHigh, in GB (0 = uncapped). Keeps the runner agent alive."
         type: string
@@ -125,6 +129,7 @@ jobs:
           [ -n "${{ inputs.quantization_recipe }}" ] && ARGS="$ARGS --quantization_recipe=${{ inputs.quantization_recipe }}"
           [ -n "${{ inputs.prefill_lengths }}"    ] && ARGS="$ARGS --prefill_lengths=${{ inputs.prefill_lengths }}"
           [ -n "${{ inputs.cache_length }}"       ] && ARGS="$ARGS --cache_length=${{ inputs.cache_length }}"
+          [ -n "${{ inputs.extra_args }}"         ] && ARGS="$ARGS ${{ inputs.extra_args }}"
           echo "extra args:${ARGS:- (none - CONTROL run)}"
           set -o pipefail
           # MEMORY CAP. Three E4B runs died with the runner AGENT starved out (lifetimes
