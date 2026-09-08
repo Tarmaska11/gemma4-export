@@ -38,6 +38,10 @@ on:
         description: "KV cache length. Empty = tool default."
         type: string
         default: ""
+      mem_high_gb:
+        description: "Cap the export via cgroup MemoryHigh, in GB (0 = uncapped). Keeps the runner agent alive."
+        type: string
+        default: "0"
       swap_gb:
         description: "Swapfile size in GB (16 GB RAM + this)."
         type: string
@@ -123,8 +127,21 @@ jobs:
           [ -n "${{ inputs.cache_length }}"       ] && ARGS="$ARGS --cache_length=${{ inputs.cache_length }}"
           echo "extra args:${ARGS:- (none - CONTROL run)}"
           set -o pipefail
+          # MEMORY CAP. Three E4B runs died with the runner AGENT starved out (lifetimes
+          # 100/52/67 min, no trend against graph size) -- the export consumed all RAM and
+          # GitHub killed the job for an unresponsive agent. MemoryHigh throttles and
+          # reclaims THIS process only, so it pages steadily against the swapfile while the
+          # agent keeps enough memory to send its heartbeat. This attacks the observed
+          # failure mode; shrinking the graph did not, because the wall is the 15 GB of
+          # bf16 weights, not the MLIR.
+          MH="${{ inputs.mem_high_gb }}"
+          RUNNER=""
+          if [ -n "$MH" ] && [ "$MH" != "0" ]; then
+            RUNNER="sudo systemd-run --scope --quiet -p MemoryHigh=${MH}G -p MemorySwapMax=infinity"
+            echo "export capped at MemoryHigh=${MH}G (runner agent keeps the rest)"
+          fi
           set -x
-          /usr/bin/time -v litert-torch export_hf \
+          $RUNNER /usr/bin/time -v litert-torch export_hf \
             --model="src-${V}" \
             --output_dir="out-${V}" \
             --externalize_embedder \
