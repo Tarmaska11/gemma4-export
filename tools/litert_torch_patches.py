@@ -129,6 +129,8 @@ __all__ = [
     "RESOURCE_ALL_DTYPES",
     "clamp_inf_values",
     "drop_float_model",
+    "resolve_recipe",
+    "select_section_recipe",
     "externalize_source_model",
     "resource_attr_dtypes",
     "runtime_const_fold_setting",
@@ -360,6 +362,97 @@ def drop_float_model(src, dst):
     _log("could not drop %s: %s" % (src, e))
 
 
+# --- P11 ------------------------------------------------------------------
+# ai-edge-quantizer 0.9.0 ships LiteRT-LM recipes for this exact model family --
+# gemma4_mixed48 / _hr / _b32 / _b64 -- but they are per-SECTION dicts keyed on
+# the litertlm section name:
+#     {'tf_lite_embedder': ..., 'tf_lite_per_layer_embedder': ...,
+#      'tf_lite_prefill_decode': ...}
+# export_hf, however, quantises each sub-model in its own Quantizer call and
+# hands the whole object to load_quantization_recipe, which wants a flat list.
+# So those recipes are unreachable from the CLI as shipped. Map the sub-model's
+# filename onto the section key and pass the matching entry.
+#
+# The same hook resolves recipes we define here, which is how int2 becomes
+# reachable: recipe.py has dynamic_wi2c_afp32 and dynamic_wi2c_hr_afp32, and
+# arithmetic on the shipped artifact says Google's embedder IS int2 --
+# E4B embed_tokens is 262144 x 2560 = 671 M params, and 671 M x 0.25 B = 168 MB
+# against the shipped section's 170.9 MB, where int4 would be 335 MB (ours: 332).
+_SECTION_FOR = {
+    "model": "tf_lite_prefill_decode",
+    "embedder": "tf_lite_embedder",
+    "per_layer_embedder": "tf_lite_per_layer_embedder",
+    "auxiliary": "tf_lite_auxiliary",
+}
+
+
+def _local_recipes(recipe_lib):
+  # Built from recipe.py primitives so there is no hand-written JSON to drift.
+  R = recipe_lib
+  op = R.TFLOperationName if hasattr(R, "TFLOperationName") else None
+  from ai_edge_quantizer import qtyping  # pylint: disable=g-import-not-at-top
+  EMB = qtyping.TFLOperationName.EMBEDDING_LOOKUP
+  FC = qtyping.TFLOperationName.FULLY_CONNECTED
+  del op
+
+  def _emb2_pld4():
+    # Google's split, as far as the section sizes can tell it: int2 embedder,
+    # int4 per-layer embedder, int4 fully-connected everywhere in the main graph
+    # except the per_layer projections, which recipe.py itself says need 8 bits.
+    return {
+        "tf_lite_embedder": R.dynamic_wi2c_afp32(operation_name=EMB),
+        "tf_lite_per_layer_embedder": R.dynamic_wi4c_afp32(operation_name=EMB),
+        "tf_lite_prefill_decode": (
+            R.dynamic_wi4c_afp32(operation_name=FC)
+            + R.dynamic_wi8c_afp32(regex="per_layer", operation_name=FC)
+        ),
+    }
+
+  def _emb2_pld4_hr():
+    # Same, with Hadamard rotations on the low-bit ops. recipe.py recommends
+    # these "typically for better quality at lower bits", which is exactly the
+    # regime int2 embeddings are in.
+    return {
+        "tf_lite_embedder": R.dynamic_wi2c_hr_afp32(operation_name=EMB),
+        "tf_lite_per_layer_embedder": R.dynamic_wi4c_hr_afp32(operation_name=EMB),
+        "tf_lite_prefill_decode": (
+            R.dynamic_wi4c_hr_afp32(operation_name=FC)
+            + R.dynamic_wi8c_afp32(regex="per_layer", operation_name=FC)
+        ),
+    }
+
+  return {"lumi_emb2_pld4": _emb2_pld4, "lumi_emb2_pld4_hr": _emb2_pld4_hr}
+
+
+def resolve_recipe(name, recipe_lib):
+  local = _local_recipes(recipe_lib)
+  if name in local:
+    _log("recipe %s (defined by litert_torch_patches)" % name)
+    return local[name]()
+  return recipe_lib.__dict__[name]()
+
+
+def select_section_recipe(recipe, model_path):
+  if not isinstance(recipe, dict):
+    return recipe
+  base = os.path.basename(str(model_path))
+  for suf in (".tflite", "_quantized"):
+    if base.endswith(suf):
+      base = base[: -len(suf)]
+  base = base.removesuffix("_quantized") if hasattr(base, "removesuffix") else base
+  key = _SECTION_FOR.get(base)
+  sub = recipe.get(key) if key else None
+  if sub is None:
+    # Loud, and visibly wrong in the section-size table rather than silently
+    # producing a float section that only shows up as +GB on the device.
+    _log("WARNING: per-section recipe has no entry for sub-model %r (key %r); "
+         "this section will be left UNQUANTISED. Keys available: %s"
+         % (base, key, sorted(recipe)))
+    return []
+  _log("per-section recipe: %s -> %s" % (base, key))
+  return sub
+
+
 # --- P7 -------------------------------------------------------------------
 def runtime_const_fold_setting():
   # None == upstream default (follows lightweight_conversion).
@@ -550,6 +643,33 @@ PATCHES = [
             "the largest remaining anonymous copy in the pipeline. Written as "
             "one line so it makes no assumption about the indent at the five "
             "call sites; `export_config` is in scope at all of them."
+        ),
+    ),
+    # ---- P11 ------------------------------------------------------------
+    Patch(
+        pid="P11",
+        module="litert_torch.generative.export_hf.core.export_lib",
+        anchor=(
+            "    else:@@"
+            "      recipe = recipe_lib.__dict__[quantization_recipe]()@@"
+            "    qt.load_quantization_recipe(recipe)"
+        ).replace("@@", NL),
+        replacement=(
+            "    else:@@"
+            "      recipe = _lt_arena.resolve_recipe(quantization_recipe, recipe_lib)  "
+            + MARK + "@@"
+            "    recipe = _lt_arena.select_section_recipe(recipe, model_path)  " + MARK + "@@"
+            "    qt.load_quantization_recipe(recipe)"
+        ).replace("@@", NL),
+        count=1,
+        why=(
+            "ai-edge-quantizer 0.9.0 ships gemma4_mixed48 / _hr / _b32 / _b64 for "
+            "exactly this model family, but they are per-SECTION dicts and "
+            "export_hf hands the whole object to a Quantizer that wants a flat "
+            "list -- so they are unreachable from the CLI as shipped. This maps "
+            "the sub-model's filename onto the section key, and resolves the "
+            "int2-embedder recipes defined in _lt_arena. Non-dict recipes are "
+            "passed through untouched, so every existing invocation is unchanged."
         ),
     ),
     # ---- P10 ------------------------------------------------------------
