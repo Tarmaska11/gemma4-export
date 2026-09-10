@@ -23,24 +23,23 @@
 #     peak anonymous memory   ~31 GiB (killed)  ->  18.4 GiB (E4B, completed)
 #
 # ---------------------------------------------------------------------------
-# HOST CHOICE -- read before picking E4B here
+# MEASURED runner facts. Re-measured 2026-09-10, because the ~72 GB in the old
+# header was inherited from an older image and is WRONG for the current one --
+# and it was about to send E4B to Kaggle for no reason.
 # ---------------------------------------------------------------------------
-# GitHub is the better host for E2B and the better host for iterating: version
-# control, no notebook layer, no preinstalled-image conflicts, artifacts by API.
-# But it is DISK-bound for E4B, not memory-bound:
+#   root disk        145 GB,  59 GB used on arrival
+#   after reclaim     119 GB free
+#   after an 18 GB swapfile  103 GB free
+#   RAM               16 GB,  4 cores
+#   E2B run           14.1 min wall, peak anon 3.6 GB, peak swap 4.5 GB
 #
-#     E4B needs  14.9 GiB source + 29.6 GiB f32 arena + the largest float
-#     .tflite alive at once (14.7 GiB) ~= 60 GB,
-#     and a reclaimed runner has ~55-65 GB *minus* the swapfile.
+# So E4B (14.9 source + 29.6 arena + a 14.7 GiB float .tflite ~= 61 GB) fits
+# here with room to spare, and `LT_DROP_FLOAT_TFLITE=1` (set by out_of_core)
+# keeps the intermediates from ever summing -- it unlinks each float .tflite as
+# soon as its quantised twin exists, 27.7 GiB of them for E4B.
 #
-# `--out_of_core` sets LT_DROP_FLOAT_TFLITE=1, which unlinks each float .tflite
-# once its quantised twin exists (27.7 GiB of E4B intermediates), and that is
-# what makes it close. If E4B runs out of disk here, use the Kaggle notebook
-# (`kaggle_e4b_export.py`, 7.9 TB scratch) -- it is the path the shipped E4B
-# artifact came from. See E4B_FREE_EXPORT.md section 6.
-#
-# MEASURED FACTS about this runner, do not re-learn:
-#   * /mnt is the SAME root disk as / (~72 GB). A swapfile on /mnt does NOT buy
+# Still true and still worth not re-learning:
+#   * /mnt is the SAME root disk as /. A swapfile on /mnt does NOT buy
 #     independent space -- a 12 G one there caused disk-full during a 10.2 GB download.
 #   * `docker image prune -af` reclaims ~4 GB; the preinstalled toolchains
 #     (Android SDK, .NET, GHC, CodeQL, Swift, Boost) another ~25 GB.
@@ -55,7 +54,7 @@ on:
   workflow_dispatch:
     inputs:
       variant:
-        description: "E2B (9.5 GiB source; the arm where correctness is measured) or E4B (14.9 GiB, disk-tight here)"
+        description: "E2B (9.5 GiB source; the arm where correctness is measured on-device) or E4B (14.9 GiB)"
         type: choice
         options: ["E2B", "E4B"]
         default: "E2B"
@@ -83,6 +82,10 @@ on:
         description: "cgroup memory.high for the export, in GB (0 = uncapped). Keeps the runner AGENT alive by throttling the export instead of letting it starve the box."
         type: string
         default: "12"
+      sliding_window_ring_buffer_size:
+        description: "Local (sliding-attention) KV ring width. Empty = SYMMETRIC KV -- every sliding layer gets the full cache_length, which is what makes local KV cost global width on device. Must be >= the config's sliding_window (512 for gemma4)."
+        type: string
+        default: ""
       swap_gb:
         description: "Swapfile size in GB. Peak anon is ~18.4 GiB for E4B / ~11 GiB for E2B against 15 GiB of RAM, so some swap is required; every GB here is a GB off the disk budget."
         type: string
@@ -102,6 +105,7 @@ jobs:
       EXTRA: ${{ inputs.extra_args }}
       MEM_HIGH_GB: ${{ inputs.mem_high_gb }}
       SWAP_GB: ${{ inputs.swap_gb }}
+      RINGBUF: ${{ inputs.sliding_window_ring_buffer_size }}
       ARENA: ${{ github.workspace }}/arena
 
     steps:
@@ -274,6 +278,7 @@ jobs:
           if [ -n "$QUANT" ];     then ARGS="$ARGS --quantization_recipe=$QUANT"; fi
           if [ -n "$PREFILL" ];   then ARGS="$ARGS --prefill_lengths=$PREFILL"; fi
           if [ -n "$CACHELEN" ];  then ARGS="$ARGS --cache_length=$CACHELEN"; fi
+          if [ -n "$RINGBUF" ];   then ARGS="$ARGS --sliding_window_ring_buffer_size=$RINGBUF"; fi
           if [ -n "$EXTRA" ];     then ARGS="$ARGS $EXTRA"; fi
           if [ -n "$OOC_FLAGS" ]; then ARGS="$ARGS $OOC_FLAGS"; fi
           echo "flags:$ARGS"
@@ -304,6 +309,19 @@ jobs:
               $ARGS
           echo "--- result ---"; ls -la "out-${V}"; free -h; df -h / | tail -1
           du -sh "$ARENA" 2>/dev/null || true
+
+      - name: Inspect the artifact (KV geometry, quantisation census, sections)
+        if: always()
+        run: |
+          # Disk size is a proxy; what binds is on-device RAM, and three of its
+          # terms are readable straight off the artifact: the per-layer
+          # kv_cache_* shapes (global vs local width), the quantised weight
+          # dtypes, and which sections are present at all. Printed into the log
+          # so a probe run costs no download.
+          for f in out-${V}/*.litertlm; do
+            [ -e "$f" ] || continue
+            python tools/inspect_artifact.py "$f" --full || true
+          done
 
       - name: Split output for release (2 GB asset cap)
         if: always()
