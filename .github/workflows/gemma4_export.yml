@@ -1,20 +1,53 @@
 # Gemma 4 -> .litertlm re-export, on a PUBLIC-repo GitHub-hosted runner.
 #
+# SOURCE OF TRUTH: research/edgeparity-cacheblend/export/gemma4_export.yml in the
+# private Clarity repo. `sync_public_repo.py` copies THIS file, plus
+# litert_torch_patches.py and export_driver.py, into Tarmaska11/gemma4-export and
+# dispatches the run. Do not hand-edit the public copy -- the next sync overwrites it.
+#
 # WHY A PUBLIC REPO: private runners are 2 cores / 8 GB and burn the free-minutes
 # allotment; public runners are 4 cores / 16 GB and are free+unlimited. This job
 # contains nothing private -- a public Google model through a public Google tool.
 #
-# MEASURED FACTS inherited from gemma4e-compile.yml (run 28809381450), do not re-learn:
+# ---------------------------------------------------------------------------
+# WHY THIS WORKFLOW CAN NOW SUCCEED WHERE SIX EARLIER RUNS DIED
+# ---------------------------------------------------------------------------
+# Every previous E4B attempt here died with the runner AGENT starved out
+# (lifetimes 100/52/67/63/35 min, no trend against graph size). The cause was
+# never the graph: `export_hf` held THREE simultaneous anonymous copies of the
+# weights -- a hardcoded fp32 upcast at load, an MLIR DenseElementsAttr copy of
+# every constant, and pinned constant-folding results -- so E4B needed ~31 GiB
+# resident. `litert_torch_patches.py` moves all of that into mmap'd files on the
+# scratch disk. Measured on the same model, same flags:
+#
+#     peak anonymous memory   ~31 GiB (killed)  ->  18.4 GiB (E4B, completed)
+#
+# ---------------------------------------------------------------------------
+# HOST CHOICE -- read before picking E4B here
+# ---------------------------------------------------------------------------
+# GitHub is the better host for E2B and the better host for iterating: version
+# control, no notebook layer, no preinstalled-image conflicts, artifacts by API.
+# But it is DISK-bound for E4B, not memory-bound:
+#
+#     E4B needs  14.9 GiB source + 29.6 GiB f32 arena + the largest float
+#     .tflite alive at once (14.7 GiB) ~= 60 GB,
+#     and a reclaimed runner has ~55-65 GB *minus* the swapfile.
+#
+# `--out_of_core` sets LT_DROP_FLOAT_TFLITE=1, which unlinks each float .tflite
+# once its quantised twin exists (27.7 GiB of E4B intermediates), and that is
+# what makes it close. If E4B runs out of disk here, use the Kaggle notebook
+# (`kaggle_e4b_export.py`, 7.9 TB scratch) -- it is the path the shipped E4B
+# artifact came from. See E4B_FREE_EXPORT.md section 6.
+#
+# MEASURED FACTS about this runner, do not re-learn:
 #   * /mnt is the SAME root disk as / (~72 GB). A swapfile on /mnt does NOT buy
 #     independent space -- a 12 G one there caused disk-full during a 10.2 GB download.
-#   * `docker image prune -af` reclaims ~4 GB.
-# The preinstalled toolchains (Android SDK, .NET, GHC, CodeQL) are another ~25 GB.
-#
-# METHOD: the FIRST run must be a CONTROL -- defaults only, aimed at reproducing a
-# working stock-equivalent artifact. Only once a control passes on-device do we vary
-# --prefill_lengths / --quantization_recipe. A failure from a varied first run is
-# unattributable, and litert-torch#994 reports exactly this export silently producing
-# a model that loads and then emits only <pad>.
+#   * `docker image prune -af` reclaims ~4 GB; the preinstalled toolchains
+#     (Android SDK, .NET, GHC, CodeQL, Swift, Boost) another ~25 GB.
+#   * `sudo systemd-run` for the memory cap does NOT work: it runs as root with
+#     root's PATH and cannot see the runner user's litert-torch (a run died at
+#     exit 127 in 3 min, before the export started). Put THIS shell into a capped
+#     cgroup instead, so PATH, env and the python install are all preserved.
 
 name: gemma4-export
 
@@ -22,45 +55,62 @@ on:
   workflow_dispatch:
     inputs:
       variant:
-        description: "E2B (9.5 GB source, do this first) or E4B (14.9 GB)"
+        description: "E2B (9.5 GiB source; the arm where correctness is measured) or E4B (14.9 GiB, disk-tight here)"
         type: choice
         options: ["E2B", "E4B"]
         default: "E2B"
+      out_of_core:
+        description: "Apply litert_torch_patches.py in out-of-core mode. Turning this OFF reproduces stock litert-torch exactly, which is the A/B arm."
+        type: boolean
+        default: true
       quantization_recipe:
-        description: "AI Edge Quantizer recipe. Empty = tool default (dynamic_wi8_afp32)."
+        description: "AI Edge Quantizer recipe. dynamic_wi4_afp32 matches the shipped int4; the tool default dynamic_wi8_afp32 makes a ~2x file."
         type: string
-        default: ""
+        default: "dynamic_wi4_afp32"
       prefill_lengths:
-        description: "Comma-separated prefill signature widths. Empty = tool default."
+        description: "Comma-separated prefill signature widths. Empty = tool default (128)."
         type: string
-        default: ""
+        default: "32,64,128"
       cache_length:
-        description: "KV cache length. Empty = tool default."
+        description: "KV cache length. MUST BE PRIME -- it is a CEILING the runtime resizes DOWN, never a sentinel that expands. Empty = tool default (4096)."
         type: string
-        default: ""
+        default: "32003"
       extra_args:
-        description: "Raw extra flags for export_hf, e.g. '--experimental_lightweight_conversion=True --use_sdpa_composite=True'. The dataclass ExportableModuleConfig has ~70 fields; fire exposes all of them."
+        description: "Raw extra flags for export_hf. apply_gpu_composites is the keystone: without it the runtime leaves gpu_optimized_single_buffer_cache_ FALSE and the whole CbRing chain is inert."
         type: string
-        default: ""
+        default: "--apply_gpu_composites=True --export_vision_encoder=False --export_audio_encoder=False"
       mem_high_gb:
-        description: "Cap the export via cgroup MemoryHigh, in GB (0 = uncapped). Keeps the runner agent alive."
+        description: "cgroup memory.high for the export, in GB (0 = uncapped). Keeps the runner AGENT alive by throttling the export instead of letting it starve the box."
         type: string
-        default: "0"
+        default: "12"
       swap_gb:
-        description: "Swapfile size in GB (16 GB RAM + this)."
+        description: "Swapfile size in GB. Peak anon is ~18.4 GiB for E4B / ~11 GiB for E2B against 15 GiB of RAM, so some swap is required; every GB here is a GB off the disk budget."
         type: string
-        default: "28"
+        default: "16"
 
 jobs:
   export:
     runs-on: ubuntu-latest
     timeout-minutes: 360        # 6 h is the GitHub-hosted hard ceiling
 
+    env:
+      V: ${{ inputs.variant }}
+      OOC: ${{ inputs.out_of_core }}
+      QUANT: ${{ inputs.quantization_recipe }}
+      PREFILL: ${{ inputs.prefill_lengths }}
+      CACHELEN: ${{ inputs.cache_length }}
+      EXTRA: ${{ inputs.extra_args }}
+      MEM_HIGH_GB: ${{ inputs.mem_high_gb }}
+      SWAP_GB: ${{ inputs.swap_gb }}
+      ARENA: ${{ github.workspace }}/arena
+
     steps:
+      - uses: actions/checkout@v4
+
       - name: Report runner (prove which tier we actually got)
         run: |
           echo "::group::specs"
-          nproc; free -h; df -h /; echo; cat /proc/cpuinfo | grep -m1 "model name"
+          nproc; free -h; df -h /; grep -m1 "model name" /proc/cpuinfo
           echo "::endgroup::"
           MEM=$(free -g | awk '/^Mem:/{print $2}')
           if [ "$MEM" -lt 15 ]; then
@@ -68,116 +118,211 @@ jobs:
             echo "::warning::Move this workflow to a PUBLIC repo for 4 cores / 16 GB."
           fi
 
-      - name: Reclaim disk (~30 GB)
+      - name: Reclaim disk
         run: |
           df -h / | tail -1
+          # Everything here is a preinstalled toolchain this job never touches.
+          # hostedtoolcache is NOT removed wholesale -- setup-python installs
+          # into it in the next step.
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
                       /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
-                      /usr/local/share/boost /usr/share/swift || true
+                      /usr/local/share/boost /usr/share/swift \
+                      /usr/share/miniconda /usr/local/lib/node_modules \
+                      /opt/az /usr/share/az_* /usr/local/graalvm \
+                      /usr/local/share/powershell /usr/local/julia* || true
           sudo docker image prune -af || true
           sudo apt-get clean
           echo "after reclaim:"; df -h / | tail -1
 
       - name: Add swap
         run: |
-          SW="${{ inputs.swap_gb }}"
-          # swapfile MUST live on / -- /mnt is the same disk (measured, see header)
-          sudo fallocate -l ${SW}G /swapfile-export
+          # The swapfile MUST live on / -- /mnt is the same disk (measured, see
+          # header). Peak anon exceeds RAM, so the kernel HAS to swap some of it;
+          # swappiness=100 makes it prefer evicting anon over the page cache,
+          # which is what we want here: the biggest anon block is 7.3 GiB of
+          # memset-zero sample KV cache that is touched once, while the page
+          # cache holds the weight arena, which is re-read constantly.
+          sudo fallocate -l ${SWAP_GB}G /swapfile-export
           sudo chmod 600 /swapfile-export
           sudo mkswap /swapfile-export
           sudo swapon /swapfile-export
-          sudo sysctl vm.swappiness=100      # we WANT aggressive swapping here
+          sudo sysctl vm.swappiness=100
           free -h; df -h / | tail -1
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"   # the version the validated Kaggle stack ran on
 
-      - name: Install litert-torch (CPU torch only)
+      - name: Install toolchain (pinned)
         run: |
+          set -eo pipefail
           python -m pip install --upgrade pip
-          # CPU wheel first so the CUDA torch (~2.5 GB extra) is never pulled
-          pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+          # PINS, each one paid for:
+          #  * transformers 5.16.1 -- litert-torch declares no lower bound and
+          #    litert_torch/.../cache.py dies with
+          #      AttributeError: module 'transformers.cache_utils' has no
+          #                      attribute 'LinearAttentionCacheLayerMixin'
+          #  * torch 2.13.0 -- litert-torch warns "Skipping import of cpp
+          #    extensions due to incompatible torch version" on older ones.
+          #    torchvision/torchaudio move in LOCKSTEP from the same CPU index:
+          #    mixing ABIs gives `operator torchvision::nms does not exist`.
+          #  * protobuf >=6.31.1 -- litert_lm_builder's generated _pb2 modules are
+          #    gencode 6.31.1 and refuse a major-mismatched runtime.
+          # CPU index first so the CUDA torch (~2.5 GB extra) is never pulled.
+          pip install --no-cache-dir 'torch==2.13.0' torchvision torchaudio \
+              --index-url https://download.pytorch.org/whl/cpu
+          pip install --no-cache-dir 'transformers==5.16.1'
           pip install --no-cache-dir litert-torch
+          pip install --no-cache-dir 'protobuf>=6.31.1,<7'
           echo "::group::versions"
-          pip list 2>/dev/null | grep -iE "litert|torch|ai-edge|jax|transformers|quantizer"
+          pip list 2>/dev/null | grep -iE "litert|^torch|transformers|ai-edge|quantizer|protobuf"
           echo "::endgroup::"
           df -h / | tail -1
 
-      - name: Download source weights
-        env:
-          V: ${{ inputs.variant }}
+      - name: Apply litert-torch patches
         run: |
+          set -eo pipefail
+          # The patch script is VENDORED into this repo by sync_public_repo.py on
+          # every dispatch, because the canonical copy lives in a PRIVATE repo and
+          # a public runner cannot reach it without a repo-scoped token in this
+          # repo's secrets. Printing the hash makes each run's log say exactly
+          # which revision it ran.
+          echo "patch script sha256: $(sha256sum tools/litert_torch_patches.py)"
+          python tools/litert_torch_patches.py --apply
+          if [ "$OOC" = "true" ]; then
+            {
+              # The out-of-core bundle. Every one of these is inert in the stock
+              # library; they only do something because the patches routed the
+              # relevant lines through litert_torch/_lt_arena.py.
+              echo "LT_LOAD_NATIVE_DTYPE=1"        # bf16 load, no fp32 upcast
+              echo "LT_ARENA_DIR=$ARENA"           # f32 weights in mmap'd files
+              echo "LT_ARENA_MIN_BYTES=1048576"
+              echo "LT_RESOURCE_ALL_DTYPES=1"      # bf16 safety net
+              echo "LT_RUNTIME_CONST_FOLD=auto"    # auto == upstream default
+              echo "LT_DROP_FLOAT_TFLITE=1"        # reap float .tflite after quantisation
+            } >> "$GITHUB_ENV"
+            echo "OOC_FLAGS=--experimental_lightweight_conversion=True" >> "$GITHUB_ENV"
+          else
+            echo "out_of_core=false: patches applied but ALL KNOBS AT UPSTREAM DEFAULTS"
+            echo "OOC_FLAGS=" >> "$GITHUB_ENV"
+          fi
+
+      - name: Smoke gate (before the multi-GB download)
+        run: |
+          set -eo pipefail
+          # Every non-memory failure in this campaign was an import-time clash,
+          # and each cost a full source download to discover. Extend this gate
+          # whenever a new import-time dependency is added.
+          python tools/litert_torch_patches.py --print-env
+          python - <<'PY'
+          import litert_torch, torch, transformers
+          import google.protobuf as pb
+          from litert_torch import _lt_arena
+          from litert_torch.generative.export_hf import export as _e
+          from litert_torch.generative.export_hf.experimental.litertlm_bundle import litertlm_bundle as _b
+          from ai_edge_quantizer import quantizer as _q
+          from transformers import cache_utils
+          assert hasattr(cache_utils, "LinearAttentionCacheLayerMixin"), "transformers too old"
+          print("SMOKE OK  torch", torch.__version__, "transformers", transformers.__version__,
+                "protobuf", pb.__version__, "load_dtype", _lt_arena.LOAD_DTYPE,
+                "arena", repr(_lt_arena.ARENA_DIR))
+          PY
+
+      - name: Download source weights
+        run: |
+          set -eo pipefail
           python - <<'PY'
           import os
           from huggingface_hub import snapshot_download
           v = os.environ["V"]
-          p = snapshot_download(
+          snapshot_download(
               f"google/gemma-4-{v}-it",
               local_dir=f"src-{v}",
               allow_patterns=["*.json", "*.safetensors", "tokenizer*", "*.model"],
           )
-          print("downloaded to", p)
           PY
           du -sh "src-${V}"; df -h / | tail -1
+          # The bf16 load is bit-faithful ONLY if the checkpoint really is bf16
+          # everywhere: torch_dtype NARROWS any f32 entry and the later widening
+          # back to f32 cannot undo that. Measure it, do not assume it.
+          python - <<'PY'
+          import collections, glob, json, os, struct
+          kinds, nbytes = collections.Counter(), collections.Counter()
+          for p in sorted(glob.glob(f"src-{os.environ['V']}/*.safetensors")):
+              with open(p, "rb") as f:
+                  n = struct.unpack("<Q", f.read(8))[0]
+                  hdr = json.loads(f.read(n))
+              for k, v in hdr.items():
+                  if k != "__metadata__":
+                      kinds[v["dtype"]] += 1
+                      nbytes[v["dtype"]] += v["data_offsets"][1] - v["data_offsets"][0]
+          print("checkpoint dtypes:", dict(kinds))
+          print("bytes by dtype (GiB):", {k: round(v / 2**30, 3) for k, v in nbytes.items()})
+          wide = {k: v for k, v in kinds.items() if k in ("F32", "F64")}
+          print("BF16 DTYPE GATE:",
+                "PASS - every float tensor is BF16, the bf16 load is exact" if not wide
+                else f"WARN - {wide} would be NARROWED by the bf16 load")
+          PY
 
       - name: Export to .litertlm
         id: export
         run: |
-          V="${{ inputs.variant }}"
+          set -eo pipefail
+          # `set -e` + `[ -n "$X" ] && ...` is a trap: when X is empty the whole
+          # compound returns non-zero and the step aborts. Use explicit ifs.
           ARGS=""
-          [ -n "${{ inputs.quantization_recipe }}" ] && ARGS="$ARGS --quantization_recipe=${{ inputs.quantization_recipe }}"
-          [ -n "${{ inputs.prefill_lengths }}"    ] && ARGS="$ARGS --prefill_lengths=${{ inputs.prefill_lengths }}"
-          [ -n "${{ inputs.cache_length }}"       ] && ARGS="$ARGS --cache_length=${{ inputs.cache_length }}"
-          [ -n "${{ inputs.extra_args }}"         ] && ARGS="$ARGS ${{ inputs.extra_args }}"
-          echo "extra args:${ARGS:- (none - CONTROL run)}"
-          set -o pipefail
-          # MEMORY CAP. Three E4B runs died with the runner AGENT starved out (lifetimes
-          # 100/52/67 min, no trend against graph size) -- the export consumed all RAM and
-          # GitHub killed the job for an unresponsive agent. MemoryHigh throttles and
-          # reclaims THIS process only, so it pages steadily against the swapfile while the
-          # agent keeps enough memory to send its heartbeat. This attacks the observed
-          # failure mode; shrinking the graph did not, because the wall is the 15 GB of
-          # bf16 weights, not the MLIR.
-          # Do NOT use `sudo systemd-run` here: it runs as root with root's PATH and
-          # cannot see the runner user's litert-torch (run 9 died at exit 127 in 3 min,
-          # before the export even started). Put THIS shell into a capped cgroup instead,
-          # so the environment, PATH and python install are all preserved and every child
-          # inherits the cap.
-          MH="${{ inputs.mem_high_gb }}"
-          if [ -n "$MH" ] && [ "$MH" != "0" ]; then
+          if [ -n "$QUANT" ];     then ARGS="$ARGS --quantization_recipe=$QUANT"; fi
+          if [ -n "$PREFILL" ];   then ARGS="$ARGS --prefill_lengths=$PREFILL"; fi
+          if [ -n "$CACHELEN" ];  then ARGS="$ARGS --cache_length=$CACHELEN"; fi
+          if [ -n "$EXTRA" ];     then ARGS="$ARGS $EXTRA"; fi
+          if [ -n "$OOC_FLAGS" ]; then ARGS="$ARGS $OOC_FLAGS"; fi
+          echo "flags:$ARGS"
+          # MEMORY CAP. memory.high throttles and reclaims THIS cgroup only, so
+          # the export pages steadily against the swapfile while the runner agent
+          # keeps enough memory to send its heartbeat. That failure mode -- agent
+          # starved, job killed with no traceback -- is what ended six runs.
+          if [ -n "$MEM_HIGH_GB" ] && [ "$MEM_HIGH_GB" != "0" ]; then
             sudo mkdir -p /sys/fs/cgroup/exportcap
             echo "+memory" | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null 2>&1 || true
-            echo "${MH}G"  | sudo tee /sys/fs/cgroup/exportcap/memory.high  >/dev/null
-            echo "max"     | sudo tee /sys/fs/cgroup/exportcap/memory.swap.max >/dev/null 2>&1 || true
-            echo $$        | sudo tee /sys/fs/cgroup/exportcap/cgroup.procs >/dev/null
+            echo "${MEM_HIGH_GB}G" | sudo tee /sys/fs/cgroup/exportcap/memory.high >/dev/null
+            echo "max" | sudo tee /sys/fs/cgroup/exportcap/memory.swap.max >/dev/null 2>&1 || true
+            echo $$ | sudo tee /sys/fs/cgroup/exportcap/cgroup.procs >/dev/null
             echo "cgroup cap applied: memory.high=$(cat /sys/fs/cgroup/exportcap/memory.high)"
-            echo "  this shell is $(cat /proc/self/cgroup | head -1)"
           fi
-          set -x
-          /usr/bin/time -v litert-torch export_hf \
-            --model="src-${V}" \
-            --output_dir="out-${V}" \
-            --externalize_embedder \
-            --jinja_chat_template_override="litert-community/gemma-4-${V}-it-litert-lm" \
-            $ARGS 2>&1 | tee export.log
-          set +x
+          # export_driver.py runs the export as a subprocess under a memory
+          # profiler that labels every sample with the export's OWN sub-stage.
+          # That is what identified the per_layer_embedder constant copy on
+          # Kaggle in one run instead of several; a bare RSS number cannot, because
+          # a healthy run here looks like "anon flat, page cache huge and collapsing".
+          python tools/export_driver.py \
+            --log export.log --memlog memprofile.txt -- \
+            litert-torch export_hf \
+              --model="src-${V}" \
+              --output_dir="out-${V}" \
+              --externalize_embedder \
+              --jinja_chat_template_override="litert-community/gemma-4-${V}-it-litert-lm" \
+              $ARGS
           echo "--- result ---"; ls -la "out-${V}"; free -h; df -h / | tail -1
+          du -sh "$ARENA" 2>/dev/null || true
 
       - name: Split output for release (2 GB asset cap)
         if: always()
         run: |
-          V="${{ inputs.variant }}"
           mkdir -p dist
           for f in out-${V}/*.litertlm; do
             [ -e "$f" ] || continue
             echo "$(basename "$f"): $(stat -c%s "$f") bytes"
             sha256sum "$f" | tee -a dist/SHA256SUMS
+            stat -c%s "$f" >> dist/SHA256SUMS
             split -b 1900M -d "$f" "dist/$(basename "$f").part"
           done
+          # free the arena and the source before the upload so the runner is not
+          # disk-bound while actions/upload-artifact stages its own copy
+          rm -rf "$ARENA" "src-${V}" || true
           ls -la dist/ 2>/dev/null || echo "no output produced"
+          df -h / | tail -1
 
-      - name: Upload artifacts (logs always, model if produced)
+      - name: Upload artifacts (telemetry always, model if produced)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -185,5 +330,6 @@ jobs:
           path: |
             dist/
             export.log
+            memprofile.txt
           retention-days: 7
           if-no-files-found: warn
