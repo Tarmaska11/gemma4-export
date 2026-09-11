@@ -45,6 +45,8 @@ TT = {0: ("FLOAT32", 32), 1: ("FLOAT16", 16), 2: ("INT32", 32), 3: ("UINT8", 8),
       14: ("VARIANT", 0), 15: ("UINT32", 32), 16: ("UINT16", 16),
       17: ("INT4", 4), 18: ("BFLOAT16", 16), 19: ("INT2", 2)}
 
+import re
+KVRE = re.compile(r"kv_cache_([kv])_(\d+)")
 KV_KEYS = ("kv_cache_", "mask", "pos", "logits", "param_tensor",
            "embeddings", "per_layer")
 
@@ -81,7 +83,7 @@ def dump_tflite(buf, label, full=False):
         kv = collections.OrderedDict()
         other = []
         for short, shape, ty in rows:
-            if short.startswith("kv_cache_"):
+            if KVRE.search(short):   # NOT startswith: ours are prefill_128_kv_cache_k_0
                 kv.setdefault((shape, ty), []).append(short)
             else:
                 other.append((short, shape, ty))
@@ -98,9 +100,11 @@ def dump_tflite(buf, label, full=False):
     print(f"\n-- weight census (constant tensors with a buffer)")
     by = collections.Counter()
     nbytes = collections.Counter()
+    seen_buffers = set()          # buffers are shared between tensors -- count once
     for sg in m.subgraphs:
         for t in sg.tensors:
-            b = m.buffers[t.buffer]
+            bi = int(t.buffer)
+            b = m.buffers[bi]
             n = 0
             if getattr(b, "data", None) is not None:
                 n = len(b.data)
@@ -110,6 +114,9 @@ def dump_tflite(buf, label, full=False):
                 continue
             ty = _tt(int(t.type))[0]
             by[ty] += 1
+            if bi in seen_buffers:
+                continue
+            seen_buffers.add(bi)
             nbytes[ty] += n
     total = sum(nbytes.values())
     for ty, n in nbytes.most_common():
