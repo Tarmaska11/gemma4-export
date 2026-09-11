@@ -413,9 +413,16 @@ def _local_recipes(recipe_lib):
   EMB = qtyping.TFLOperationName.EMBEDDING_LOOKUP
   FC = qtyping.TFLOperationName.FULLY_CONNECTED
 
-  # Our LM head tensor is named ...Linear_lm_head (decode subgraph only -- prefill emits
-  # no logits), and no other weight in the section matches it.
-  LM_HEAD = "lm_head"
+  # THE REGEX MATCHES THE OP SCOPE, WHICH IS THE OUTPUT TENSOR NAME -- NOT the weight
+  # tensor name. tfl_flatbuffer_utils.get_op_scope: "Op scope is defined by the output
+  # tensor names (following ModelExplorer)", and recipe_manager line 183 does
+  # re.search(scope_regex, scope_name) on that. A first attempt used "lm_head", which is
+  # the WEIGHT name (...torch.nn.modules.linear.Linear_lm_head), and it silently matched
+  # nothing: the run completed, every other group landed exactly, and the LM head stayed
+  # at INT4 -- 320 MiB of the miss, visible only in the census. Our lm-head
+  # FULLY_CONNECTED emits `decode_logits_output`; the shipped E4B emits
+  # .../LanguageModel.decode_softmax/... , which is the same idea in Google naming.
+  LM_HEAD = "decode_logits"
 
   def _parity(hr=False):
     w2 = R.dynamic_wi2c_hr_afp32 if hr else R.dynamic_wi2c_afp32
