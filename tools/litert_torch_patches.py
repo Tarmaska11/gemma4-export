@@ -387,41 +387,57 @@ _SECTION_FOR = {
 
 
 def _local_recipes(recipe_lib):
-  # Built from recipe.py primitives so there is no hand-written JSON to drift.
+  # MEASURED from the shipped E4B, not chosen. graphtools/precision_map.py dumps every
+  # weight buffer of gemma-e4b-v2arch.litertlm.CLIstock with its dtype and granularity;
+  # the assignment is:
+  #
+  #   tf_lite_embedder            1 buffer   INT2 channelwise   167.8 MB
+  #   tf_lite_per_layer_embedder  42 buffers INT2 channelwise   704.6 MB
+  #   tf_lite_prefill_decode      258        INT4 channelwise  1945.1 MB
+  #                                85        INT8 channelwise    82.6 MB
+  #                                 1        INT2 channelwise   167.8 MB  (the LM head)
+  #
+  # and the INT8 group is an EXACT regex partition: all 85 names contain "per_layer"
+  # and none of the 258 INT4 names do. Shapes 42x[256,2560] + 42x[2560,256] +
+  # 1x[10752,2560] = the per-layer input gates, projections and model projection.
+  # That is literally what recipe.py's own gemma4_mixed48 does for prefill_decode
+  # ("Per-layer embeddings need 8 bits"), so the only things it lacks are INT2 on the
+  # two embedding sections and INT2 on the LM head.
+  #
+  # WE MATCH INT8 EVEN THOUGH IT MAKES US ~41 MB BIGGER THERE. The brief is to reach
+  # 3.66 GB "in exactly the same way": Google chose 8 bits on those tensors for a reason
+  # we cannot see from outside, and quantising them harder to win 41 MB is how quality
+  # gets lost silently.
   R = recipe_lib
-  op = R.TFLOperationName if hasattr(R, "TFLOperationName") else None
   from ai_edge_quantizer import qtyping  # pylint: disable=g-import-not-at-top
   EMB = qtyping.TFLOperationName.EMBEDDING_LOOKUP
   FC = qtyping.TFLOperationName.FULLY_CONNECTED
-  del op
 
-  def _emb2_pld4():
-    # Google's split, as far as the section sizes can tell it: int2 embedder,
-    # int4 per-layer embedder, int4 fully-connected everywhere in the main graph
-    # except the per_layer projections, which recipe.py itself says need 8 bits.
+  # Our LM head tensor is named ...Linear_lm_head (decode subgraph only -- prefill emits
+  # no logits), and no other weight in the section matches it.
+  LM_HEAD = "lm_head"
+
+  def _parity(hr=False):
+    w2 = R.dynamic_wi2c_hr_afp32 if hr else R.dynamic_wi2c_afp32
+    w4 = R.dynamic_wi4c_hr_afp32 if hr else R.dynamic_wi4c_afp32
     return {
-        "tf_lite_embedder": R.dynamic_wi2c_afp32(operation_name=EMB),
-        "tf_lite_per_layer_embedder": R.dynamic_wi4c_afp32(operation_name=EMB),
+        "tf_lite_embedder": w2(operation_name=EMB),
+        "tf_lite_per_layer_embedder": w2(operation_name=EMB),
         "tf_lite_prefill_decode": (
-            R.dynamic_wi4c_afp32(operation_name=FC)
+            w4(operation_name=FC)
             + R.dynamic_wi8c_afp32(regex="per_layer", operation_name=FC)
+            + w2(regex=LM_HEAD, operation_name=FC)
         ),
     }
 
-  def _emb2_pld4_hr():
-    # Same, with Hadamard rotations on the low-bit ops. recipe.py recommends
-    # these "typically for better quality at lower bits", which is exactly the
-    # regime int2 embeddings are in.
-    return {
-        "tf_lite_embedder": R.dynamic_wi2c_hr_afp32(operation_name=EMB),
-        "tf_lite_per_layer_embedder": R.dynamic_wi4c_hr_afp32(operation_name=EMB),
-        "tf_lite_prefill_decode": (
-            R.dynamic_wi4c_hr_afp32(operation_name=FC)
-            + R.dynamic_wi8c_afp32(regex="per_layer", operation_name=FC)
-        ),
-    }
-
-  return {"lumi_emb2_pld4": _emb2_pld4, "lumi_emb2_pld4_hr": _emb2_pld4_hr}
+  return {
+      "lumi_e4b_parity": lambda: _parity(hr=False),
+      # Hadamard rotations on the low-bit ops. recipe.py recommends them "typically for
+      # better quality at lower bits", which is the regime INT2 is in. Untested against
+      # the shipped artifact -- it is a QUALITY variant, not a size one, and both produce
+      # the same bytes.
+      "lumi_e4b_parity_hr": lambda: _parity(hr=True),
+  }
 
 
 def resolve_recipe(name, recipe_lib):
